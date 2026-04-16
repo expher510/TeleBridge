@@ -1,14 +1,7 @@
 // ============================================================
-//  TeleBridge 🌉 v2.0
+//  TeleBridge 🌉 v2.1
 //  Vercel Proxy — يربط n8n بـ Telegram ويتجاوز الحظر
 //  ✅ يستخدم Vercel KV لحفظ الـ n8n URL بشكل دائم
-//
-//  كيفية الاستخدام:
-//  1. في Vercel Dashboard → Storage → Create KV Database
-//  2. اربط الـ KV بالمشروع (Connect to Project)
-//  3. Deploy على Vercel
-//  4. في n8n → Credentials → Telegram → Base URL = https://your-app.vercel.app
-//  5. شغّل الـ Telegram Trigger → كل حاجة هتشتغل أوتوماتيك ✅
 // ============================================================
 
 import { kv } from "@vercel/kv";
@@ -54,14 +47,61 @@ const UPLOAD_FIELD_NAMES = {
   sendSticker:   "sticker",
 };
 
+// ──────────────────────────────────────────────────────────
+//  FIX A: Helper — Parse JSON body manually
+//  Vercel doesn't auto-parse req.body in raw handlers
+// ──────────────────────────────────────────────────────────
+async function parseJsonBody(req) {
+  // If Vercel already parsed it (e.g. via bodyParser config), use it
+  if (req.body && typeof req.body === "object") return req.body;
+
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => (data += chunk));
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch {
+        resolve({}); // malformed JSON → safe empty object
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// ──────────────────────────────────────────────────────────
+//  FIX A: Helper — Parse raw binary body
+// ──────────────────────────────────────────────────────────
+async function parseRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+// ──────────────────────────────────────────────────────────
+//  FIX B: Helper — Parse query string manually
+//  Vercel doesn't populate req.query automatically
+// ──────────────────────────────────────────────────────────
+function parseQuery(url) {
+  const qIndex = url.indexOf("?");
+  if (qIndex === -1) return {};
+  return Object.fromEntries(new URLSearchParams(url.slice(qIndex + 1)));
+}
+
 // ══════════════════════════════════════════════════════════
 export default async function handler(req, res) {
 
-  const path = req.url.split("?")[0];
+  const fullUrl = req.url;
+  const path    = fullUrl.split("?")[0];
+
+  // FIX B: Always parse query from URL string
+  const query = parseQuery(fullUrl);
 
   // ──────────────────────────────────────────────────────
   // 🔵 Route 1: Telegram → Vercel → n8n
-  //    Telegram بيبعت الـ Updates هنا
   // ──────────────────────────────────────────────────────
   if (path === "/api/webhook") {
 
@@ -69,10 +109,10 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: "🟢 TeleBridge Webhook ready" });
     }
 
-    const body = req.body;
+    // FIX A: Parse body manually
+    const body = await parseJsonBody(req);
     console.log("📨 Telegram Update:", JSON.stringify(body));
 
-    // ✅ جيب الـ n8n URL من Vercel KV (مش من process.env)
     const n8nUrl = await kv.get("n8n_webhook_url");
 
     if (!n8nUrl) {
@@ -87,7 +127,6 @@ export default async function handler(req, res) {
         body:    JSON.stringify(body),
         signal:  AbortSignal.timeout(55000),
       });
-
       console.log(`✅ n8n Response [${n8nResponse.status}]`);
     } catch (err) {
       console.error("❌ Forward to n8n failed:", err.message);
@@ -97,9 +136,7 @@ export default async function handler(req, res) {
   }
 
   // ──────────────────────────────────────────────────────
-  // 🟡 Route 2: n8n Telegram Node/Trigger → Vercel → Telegram
-  //    n8n بيبعت لـ /bot{TOKEN}/{method}
-  //    Vercel بيعترض setWebhook ويغير الـ URL لنفسه
+  // 🟡 Route 2: n8n → Vercel → Telegram
   // ──────────────────────────────────────────────────────
   const botRoute = path.match(/^\/bot([^/]+)\/(.+)$/);
   if (botRoute) {
@@ -110,15 +147,14 @@ export default async function handler(req, res) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    let body = req.body || {};
+    // FIX A: Parse body manually
+    let body = await parseJsonBody(req);
 
-    // ── اعترض setWebhook وغيّر الـ URL ──────────────────
     if (method === "setWebhook") {
 
       const originalUrl = body.url;
       console.log("🔗 n8n Webhook URL:", originalUrl);
 
-      // ✅ احفظ الـ n8n URL في Vercel KV — بيفضل محفوظ دايماً
       await kv.set("n8n_webhook_url", originalUrl);
       console.log("💾 n8n URL saved to KV:", originalUrl);
 
@@ -136,7 +172,6 @@ export default async function handler(req, res) {
       console.log("✅ setWebhook intercepted → URL changed to Vercel");
     }
 
-    // ── مرّر الـ Request لـ Telegram ─────────────────────
     try {
       console.log(`📤 Proxying [${method}] → Telegram API`);
 
@@ -161,7 +196,6 @@ export default async function handler(req, res) {
 
   // ──────────────────────────────────────────────────────
   // 📥 Route 3: تحميل ملف من Telegram
-  //    GET /api/file?file_id=xxx&token=xxx
   // ──────────────────────────────────────────────────────
   if (path === "/api/file") {
 
@@ -169,7 +203,8 @@ export default async function handler(req, res) {
       return res.status(405).json({ error: "Use GET" });
     }
 
-    const { file_id, token } = req.query;
+    // FIX B: Use parsed query object
+    const { file_id, token } = query;
 
     if (!file_id) return res.status(400).json({ error: "❌ file_id required" });
     if (!token)   return res.status(400).json({ error: "❌ token required" });
@@ -177,7 +212,6 @@ export default async function handler(req, res) {
     try {
       console.log(`📥 Downloading file_id: ${file_id}`);
 
-      // Step 1: جيب file_path من Telegram
       const getFileRes  = await fetch(`${TELEGRAM_API}/bot${token}/getFile`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
@@ -192,7 +226,6 @@ export default async function handler(req, res) {
       const file_path = getFileData.result.file_path;
       console.log(`📁 file_path: ${file_path}`);
 
-      // Step 2: حمّل الملف
       const fileRes = await fetch(
         `${TELEGRAM_API}/file/bot${token}/${file_path}`
       );
@@ -222,7 +255,6 @@ export default async function handler(req, res) {
 
   // ──────────────────────────────────────────────────────
   // 📤 Route 4: رفع ملف Binary لـ Telegram
-  //    POST /api/upload?method=sendDocument&chat_id=xxx&token=xxx
   // ──────────────────────────────────────────────────────
   if (path === "/api/upload") {
 
@@ -230,6 +262,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: "🟢 Upload endpoint ready" });
     }
 
+    // FIX B: Use parsed query object
     const {
       method   = "sendDocument",
       chat_id,
@@ -237,15 +270,14 @@ export default async function handler(req, res) {
       caption  = "",
       filename = "file",
       mimetype = "application/octet-stream",
-    } = req.query;
+    } = query;
 
     if (!chat_id) return res.status(400).json({ error: "❌ chat_id required" });
     if (!token)   return res.status(400).json({ error: "❌ token required" });
 
     try {
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const fileBuffer = Buffer.concat(chunks);
+      // FIX C: Use helper instead of streaming `req` directly
+      const fileBuffer = await parseRawBody(req);
 
       console.log(`📤 Uploading [${method}] → chat_id: ${chat_id} | ${fileBuffer.byteLength} bytes`);
 
@@ -276,16 +308,14 @@ export default async function handler(req, res) {
   }
 
   // ──────────────────────────────────────────────────────
-  // ℹ️ Health Check + Docs
+  // ℹ️ Health Check
   // ──────────────────────────────────────────────────────
-  const vercelHost = process.env.VERCEL_URL || req.headers.host;
-
-  // ✅ جيب الـ n8n URL من KV عشان يظهر في الـ health check
+  const vercelHost  = process.env.VERCEL_URL || req.headers.host;
   const savedN8nUrl = await kv.get("n8n_webhook_url");
 
   return res.status(200).json({
     name:    "🌉 TeleBridge",
-    version: "2.0.0",
+    version: "2.1.0",
     status:  "🟢 Running",
     n8n_url: savedN8nUrl || "⏳ Waiting for Telegram Trigger to register...",
 
