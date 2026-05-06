@@ -57,6 +57,19 @@ function getPublicBaseUrl(req) {
   return `${protocol}://${host}`;
 }
 
+function getUpdateType(update) {
+  return Object.keys(update || {}).find(key => key !== "update_id") || "unknown";
+}
+
+function getSafeUrlLabel(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
 async function parseJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   return new Promise((resolve) => {
@@ -140,14 +153,27 @@ export default async function handler(req, res) {
         return res.status(404).json({ ok: false, error: "No saved n8n webhook URL for this bot token" });
       }
 
-      await fetch(n8nUrl, {
+      const updateType = getUpdateType(body);
+      console.log("Forwarding Telegram update to n8n", {
+        updateId: body.update_id,
+        updateType,
+        n8nTarget: getSafeUrlLabel(n8nUrl),
+      });
+
+      const n8nResponse = await fetch(n8nUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(55000),
       });
+      const n8nBody = await n8nResponse.text();
+      console.log("n8n webhook response", {
+        status: n8nResponse.status,
+        ok: n8nResponse.ok,
+        body: n8nBody.slice(0, 500),
+      });
 
-      return res.status(200).json({ ok: true });
+      return res.status(200).json({ ok: true, forwarded: n8nResponse.ok, n8nStatus: n8nResponse.status });
     }
 
     // 🟡 Route 2: n8n → Vercel → Telegram
