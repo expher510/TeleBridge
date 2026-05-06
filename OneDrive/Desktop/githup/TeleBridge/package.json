@@ -1,0 +1,8 @@
+{
+  "name": "telebridge",
+  "version": "3.0.0",
+  "type": "module",
+  "dependencies": {
+    "@upstash/redis": "latest"
+  }
+}
