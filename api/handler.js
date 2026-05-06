@@ -39,13 +39,29 @@ function parseQuery(url) {
   return Object.fromEntries(new URLSearchParams(url.slice(i + 1)));
 }
 
+function buildQueryString(params) {
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null && v !== "") search.set(k, String(v));
+  }
+  const qs = search.toString();
+  return qs ? `?${qs}` : "";
+}
+
 async function parseJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   return new Promise((resolve) => {
     let data = "";
     req.on("data", chunk => (data += chunk));
     req.on("end", () => {
-      try { resolve(data ? JSON.parse(data) : {}); }
+      if (!data) return resolve({});
+
+      const contentType = (req.headers["content-type"] || "").toLowerCase();
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        return resolve(Object.fromEntries(new URLSearchParams(data)));
+      }
+
+      try { resolve(JSON.parse(data)); }
       catch { resolve({}); }
     });
     req.on("error", () => resolve({}));
@@ -70,19 +86,49 @@ export default async function handler(req, res) {
   const query = parseQuery(fullUrl); // الآن parseQuery معرفة ولن تعطي خطأ
 
   try {
+    if (path === "/api/diag") {
+      const token = query.token;
+      const hasKvEnv = Boolean(
+        process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL
+      ) && Boolean(
+        process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
+      );
+
+      let savedWebhook = null;
+      if (token) {
+        try {
+          savedWebhook = await kv.get(`webhook:${token}`);
+        } catch {
+          savedWebhook = null;
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        route: "/api/diag",
+        hasKvEnv,
+        tokenProvided: Boolean(token),
+        webhookSaved: Boolean(savedWebhook),
+        savedWebhook,
+      });
+    }
+
     // 🔵 Route 1: Telegram → Vercel → n8n
     if (path === "/api/webhook") {
       if (req.method !== "POST") return res.status(200).send("🟢 Webhook Ready");
 
       const body = await parseJsonBody(req);
       const token = query.token;
+      if (!token) {
+        return res.status(400).json({ error: "Missing token in webhook query string" });
+      }
 
       // جلب الرابط الخاص بالتوكن المحدد
       const n8nUrl = await kv.get(`webhook:${token}`);
 
       if (!n8nUrl) {
-        console.error(`❌ No URL saved for this bot token.`);
-        return res.status(200).json({ ok: true });
+        console.error(`❌ No URL saved for bot token: ${token}`);
+        return res.status(404).json({ ok: false, error: "No saved n8n webhook URL for this bot token" });
       }
 
       await fetch(n8nUrl, {
@@ -101,14 +147,23 @@ export default async function handler(req, res) {
       const [, token, method] = botRoute;
 
       if (req.method === "GET") {
-        const tgRes = await fetch(`${TELEGRAM_API}/bot${token}/${method}`);
-        return res.status(200).json(await tgRes.json());
+        const params = { ...query };
+        if (method === "setWebhook" && params.url) {
+          await kv.set(`webhook:${token}`, params.url);
+          const vercelHost = process.env.VERCEL_URL || req.headers.host;
+          params.url = `https://${vercelHost}/api/webhook?token=${token}`;
+        }
+        const tgRes = await fetch(`${TELEGRAM_API}/bot${token}/${method}${buildQueryString(params)}`);
+        return res.status(tgRes.status).json(await tgRes.json());
       }
 
       let body = await parseJsonBody(req);
 
       // اعتراض setWebhook لتوجيه التحديثات للـ Bridge
       if (method === "setWebhook") {
+        if (!body.url) {
+          return res.status(400).json({ ok: false, error: "setWebhook requires url" });
+        }
         await kv.set(`webhook:${token}`, body.url);
         const vercelHost = process.env.VERCEL_URL || req.headers.host;
         body.url = `https://${vercelHost}/api/webhook?token=${token}`;
@@ -119,7 +174,7 @@ export default async function handler(req, res) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      return res.status(200).json(await tgResponse.json());
+      return res.status(tgResponse.status).json(await tgResponse.json());
     }
 
     // 📥 Route 3: Download File
@@ -145,7 +200,7 @@ export default async function handler(req, res) {
         method: "POST",
         body: formData
       });
-      return res.status(200).json(await tgResponse.json());
+      return res.status(tgResponse.status).json(await tgResponse.json());
     }
 
     // Health Check
