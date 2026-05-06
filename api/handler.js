@@ -154,15 +154,22 @@ export default async function handler(req, res) {
       }
 
       const updateType = getUpdateType(body);
+      const n8nSecret = await kv.get(`webhookSecret:${token}`);
+      const n8nHeaders = { "Content-Type": "application/json" };
+      if (n8nSecret) {
+        n8nHeaders["X-Telegram-Bot-Api-Secret-Token"] = n8nSecret;
+      }
+
       console.log("Forwarding Telegram update to n8n", {
         updateId: body.update_id,
         updateType,
         n8nTarget: getSafeUrlLabel(n8nUrl),
+        secretForwarded: Boolean(n8nSecret),
       });
 
       const n8nResponse = await fetch(n8nUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: n8nHeaders,
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(55000),
       });
@@ -185,6 +192,9 @@ export default async function handler(req, res) {
         const params = { ...query };
         if (method === "setWebhook" && params.url) {
           await kv.set(`webhook:${token}`, params.url);
+          if (params.secret_token) {
+            await kv.set(`webhookSecret:${token}`, params.secret_token);
+          }
           params.url = `${getPublicBaseUrl(req)}/api/webhook?token=${token}`;
         }
         const tgRes = await fetch(`${TELEGRAM_API}/bot${token}/${method}${buildQueryString(params)}`);
@@ -199,6 +209,9 @@ export default async function handler(req, res) {
           return res.status(400).json({ ok: false, error: "setWebhook requires url" });
         }
         await kv.set(`webhook:${token}`, body.url);
+        if (body.secret_token) {
+          await kv.set(`webhookSecret:${token}`, body.secret_token);
+        }
         body.url = `${getPublicBaseUrl(req)}/api/webhook?token=${token}`;
       }
 
