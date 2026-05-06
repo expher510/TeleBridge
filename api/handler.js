@@ -48,6 +48,15 @@ function buildQueryString(params) {
   return qs ? `?${qs}` : "";
 }
 
+function getPublicBaseUrl(req) {
+  const configuredUrl = process.env.BRIDGE_PUBLIC_URL || process.env.PUBLIC_BASE_URL;
+  if (configuredUrl) return configuredUrl.replace(/\/+$/, "");
+
+  const host = req.headers["x-forwarded-host"] || req.headers.host || process.env.VERCEL_URL;
+  const protocol = req.headers["x-forwarded-proto"] || "https";
+  return `${protocol}://${host}`;
+}
+
 async function parseJsonBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   return new Promise((resolve) => {
@@ -150,8 +159,7 @@ export default async function handler(req, res) {
         const params = { ...query };
         if (method === "setWebhook" && params.url) {
           await kv.set(`webhook:${token}`, params.url);
-          const vercelHost = process.env.VERCEL_URL || req.headers.host;
-          params.url = `https://${vercelHost}/api/webhook?token=${token}`;
+          params.url = `${getPublicBaseUrl(req)}/api/webhook?token=${token}`;
         }
         const tgRes = await fetch(`${TELEGRAM_API}/bot${token}/${method}${buildQueryString(params)}`);
         return res.status(tgRes.status).json(await tgRes.json());
@@ -165,8 +173,7 @@ export default async function handler(req, res) {
           return res.status(400).json({ ok: false, error: "setWebhook requires url" });
         }
         await kv.set(`webhook:${token}`, body.url);
-        const vercelHost = process.env.VERCEL_URL || req.headers.host;
-        body.url = `https://${vercelHost}/api/webhook?token=${token}`;
+        body.url = `${getPublicBaseUrl(req)}/api/webhook?token=${token}`;
       }
 
       const tgResponse = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
